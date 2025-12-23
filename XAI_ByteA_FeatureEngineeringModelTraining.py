@@ -16,9 +16,10 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import train_test_split, StratifiedKFold, RandomizedSearchCV
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.impute import KNNImputer
+from sklearn.decomposition import PCA
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -43,8 +44,8 @@ log("Start")
 
 # ---------- CONFIG ----------
 FAST_MODE = True  # Set to False to allow deeper search (slower but possibly better accuracy)
-# Use F1 so we jointly optimize precision & recall, which usually improves both recall and overall accuracy
-PRIMARY_METRIC = "f1"
+# Primary objective: maximize recall (sensitivity) while still tracking accuracy/AUC
+PRIMARY_METRIC = "recall"
 
 
 # ---------- Load data ----------
@@ -114,30 +115,35 @@ base_rf = RandomForestClassifier(
 )
 
 
-# ---------- Hyperparameter search ----------
-log(f"Preparing RandomizedSearchCV (primary metric: {PRIMARY_METRIC})...")
+# ---------- Hyperparameter search (GridSearchCV) ----------
+log(f"Preparing GridSearchCV (primary metric: {PRIMARY_METRIC})...")
 cv_splits = 3 if FAST_MODE else 5
 cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42)
 
-param_distributions = {
-    "n_estimators": [300, 400, 600, 900],
-    "max_depth": [None, 10, 20, 40],
-    "min_samples_split": [2, 4, 6],
-    "min_samples_leaf": [1, 2, 3],
+param_grid = {
+    "n_estimators": [300, 500] if FAST_MODE else [300, 500, 800],
+    "max_depth": [None, 15, 30],
+    "min_samples_split": [2, 4],
+    "min_samples_leaf": [1, 2],
     "max_features": ["sqrt", "log2"],
 }
 
-n_iter = 10 if FAST_MODE else 25
-log(f"RandomizedSearchCV: n_iter={n_iter}, cv={cv_splits}")
+log(f"GridSearchCV over {len(param_grid['n_estimators']) * len(param_grid['max_depth']) * len(param_grid['min_samples_split']) * len(param_grid['min_samples_leaf']) * len(param_grid['max_features'])} combinations, cv={cv_splits}")
 
-search = RandomizedSearchCV(
+search = GridSearchCV(
     estimator=base_rf,
-    param_distributions=param_distributions,
-    n_iter=n_iter,
-    scoring=PRIMARY_METRIC,
+    param_grid=param_grid,
+    scoring={
+        "accuracy": "accuracy",
+        "precision": "precision",
+        "recall": "recall",
+        "f1": "f1",
+        "roc_auc": "roc_auc",
+    },
+    # Refit the model that maximizes cross-validated recall
+    refit=PRIMARY_METRIC,
     n_jobs=-1,
     cv=cv,
-    random_state=42,
     verbose=1 if not FAST_MODE else 0,
 )
 
@@ -300,7 +306,43 @@ sns.set_palette("husl")
 # ---------- Load data ----------
 log("Loading dataset...")
 df = pd.read_excel('AI_ByteA_CleanedDataset.xlsx', engine='openpyxl')
-log(f"Data shape: {df.shape}")
+log(f"Raw data shape: {df.shape}")
+
+# ---------- Quick structural analysis (EDA) ----------
+log(f"Number of duplicate rows before drop: {df.duplicated().sum()}")
+log("Missing value ratio per column (top 10):")
+log(df.isna().mean().sort_values(ascending=False).head(10).to_string())
+
+# Basic description of numeric columns to inspect ranges / outliers
+log("Numeric feature summary:")
+log(df.select_dtypes(include=[np.number]).describe(percentiles=[0.01, 0.5, 0.99]).to_string())
+
+# ---------- Basic cleaning: drop duplicates ----------
+df = df.drop_duplicates().reset_index(drop=True)
+log(f"Data shape after dropping duplicates: {df.shape}")
+
+# ---------- Coerce numeric columns & cap extreme outliers ----------
+num_cols_raw = df.select_dtypes(include=[np.number]).columns.tolist()
+for col in num_cols_raw:
+    # Coerce any bad formats to NaN to avoid silent string issues
+    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+numeric_df = df[num_cols_raw]
+q1 = numeric_df.quantile(0.01)
+q99 = numeric_df.quantile(0.99)
+# Winsorize numeric features so extreme outliers don't distort scaling
+df[num_cols_raw] = numeric_df.clip(lower=q1, upper=q99, axis=1)
+
+# ---------- Simple feature engineering (safe, recall-friendly) ----------
+# Example: derive AgeBucket if Age exists to let models capture non-linear age-risk patterns
+if 'Age' in df.columns:
+    log("Creating AgeBucket feature from Age...")
+    df['AgeBucket'] = pd.cut(
+        df['Age'],
+        bins=[0, 30, 45, 60, 75, 120],
+        labels=[0, 1, 2, 3, 4],
+        include_lowest=True
+    ).astype('int64')
 
 # ---------- Encode categoricals ----------
 log("Encoding categoricals...")
@@ -319,34 +361,42 @@ drop_cols = ['PatientID', target_col] if 'PatientID' in df.columns else [target_
 X = df.drop(columns=drop_cols, errors='ignore')
 y = df[target_col].astype(int)
 
-# ---------- Impute ----------
-log("Imputing missing values with KNNImputer...")
-imputer = KNNImputer(n_neighbors=3 if FAST_MODE else 5)
-X = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
-
-# ---------- Remove very low variance ----------
-log("Variance thresholding...")
-var_threshold = VarianceThreshold(threshold=0.0 if FAST_MODE else 0.0001)
-X = pd.DataFrame(var_threshold.fit_transform(X), columns=X.columns[var_threshold.get_support()])
-
-# ---------- Scale (no polynomial expansion; keep original feature space) ----------
-log("Scaling features with StandardScaler (no polynomial features)...")
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
-
-# ---------- (Optional) Feature selection ----------
-# For now, keep all scaled features – tree-based models handle redundancy well,
-# and aggressive selection was hurting test accuracy.
-X_selected = X_scaled
-log(f"Selected shape (no FS): {X_selected.shape}")
-
-# ---------- Split ----------
+# ---------- Train / test split (before fitting imputers/scalers to avoid leakage) ----------
 test_size = 0.2 if FAST_MODE else 0.1
 log(f"Train/test split (test_size={test_size})...")
 X_train, X_test, y_train, y_test = train_test_split(
-    X_selected, y, test_size=test_size, random_state=42, stratify=y
+    X, y, test_size=test_size, random_state=42, stratify=y
 )
 log(f"Train: {X_train.shape}, Test: {X_test.shape}")
+
+# ---------- Impute (fit only on train, then transform test) ----------
+log("Imputing missing values on train with KNNImputer (no leakage)...")
+imputer = KNNImputer(n_neighbors=3 if FAST_MODE else 5)
+X_train_imp = pd.DataFrame(imputer.fit_transform(X_train), columns=X_train.columns)
+X_test_imp = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns)
+
+# ---------- Remove very low variance (fit on train only) ----------
+log("Variance thresholding (fit on train only)...")
+var_threshold = VarianceThreshold(threshold=0.0 if FAST_MODE else 0.0001)
+X_train_var = var_threshold.fit_transform(X_train_imp)
+X_test_var = var_threshold.transform(X_test_imp)
+
+# ---------- Scale (fit scaler on train only to avoid test leakage) ----------
+log("Scaling features with StandardScaler (fit on train only)...")
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_var)
+X_test_scaled = scaler.transform(X_test_var)
+
+# ---------- PCA for dimensionality reduction (helps prevent overfitting) ----------
+log("Applying PCA for dimensionality reduction (preserve ~95% variance)...")
+# n_components=0.95 chooses the number of components that explain ~95% of variance
+pca = PCA(n_components=0.95, random_state=42)
+X_train_pca = pca.fit_transform(X_train_scaled)
+X_test_pca = pca.transform(X_test_scaled)
+log(f"PCA-transformed shape: train={X_train_pca.shape}, test={X_test_pca.shape}")
+
+# Downstream models will now use the PCA feature space
+X_train, X_test = X_train_pca, X_test_pca
 
 # ---------- Balance (use SMOTE if available) ----------
 if SMOTE_AVAILABLE:
@@ -433,12 +483,12 @@ if XGBOOST_AVAILABLE:
 else:
     log("XGBoost not available; skipping XGBoost model.")
 
-# ---------- Lightweight hyperparameter tuning (RandomForest & GradientBoosting) ----------
-log("Preparing hyperparameter search (accuracy-focused, limited for speed)...")
+# ---------- Lightweight hyperparameter tuning (RandomForest, GradientBoosting, XGBoost) with GridSearchCV ----------
+log("Preparing hyperparameter search with GridSearchCV (F1-focused, limited for speed)...")
 cv_splits = 3 if FAST_MODE else 5
 cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42)
 
-param_distributions = {
+param_grids = {
     'RandomForest': {
         'n_estimators': [300, 400, 600, 900],
         'max_depth': [None, 10, 20, 40],
@@ -455,28 +505,33 @@ param_distributions = {
 }
 
 if XGBOOST_AVAILABLE:
-    param_distributions['XGBoost'] = {
+    param_grids['XGBoost'] = {
         'n_estimators': [200, 300, 500],
         'max_depth': [3, 4, 5],
         'learning_rate': [0.01, 0.03, 0.05],
         'subsample': [0.8, 0.9, 1.0],
-        'colsample_bytree': [0.7, 0.8, 1.0],
+        'colsample_bytree': [0.7, 0.8],
     }
 
-for m_name, grid in param_distributions.items():
+for m_name, grid in param_grids.items():
     if m_name not in models:
         continue
     base_model = models[m_name]
-    n_iter = 5 if FAST_MODE else 15
-    log(f"Tuning {m_name} with RandomizedSearchCV (n_iter={n_iter}, cv={cv_splits})...")
-    search = RandomizedSearchCV(
+    log(f"Tuning {m_name} with GridSearchCV (cv={cv_splits})...")
+    search = GridSearchCV(
         estimator=base_model,
-        param_distributions=grid,
-        n_iter=n_iter,
-        scoring='f1',  # tune for a balance of precision & recall
+        param_grid=grid,
+        scoring={
+            "accuracy": "accuracy",
+            "precision": "precision",
+            "recall": "recall",
+            "f1": "f1",
+            "roc_auc": "roc_auc",
+        },
+        # Choose the configuration with the highest cross-validated recall
+        refit="recall",
         n_jobs=-1,
         cv=cv,
-        random_state=42,
         verbose=1 if not FAST_MODE else 0
     )
     search.fit(X_train_bal, y_train_bal)
@@ -532,15 +587,13 @@ for name, model in models.items():
     log(f"{name} done in {fit_time:.2f}s | AUC={auc_score:.3f}")
 
 results_df = pd.DataFrame(results)
-# Rank models by AUC (higher is better), similar to reference table
-results_df['Rank'] = results_df['AUC'].rank(ascending=False, method='min').astype(int)
 
-# Mark top-k models as selected (e.g., best 3 by AUC)
-TOP_K_SELECTED = 3
-results_df['Selected'] = (results_df['Rank'] <= TOP_K_SELECTED).astype(int)
+# Sort models by Recall (primary) and AUC (secondary) so ranking reflects real test performance
+results_df = results_df.sort_values(['Recall', 'AUC'], ascending=[False, False]).reset_index(drop=True)
+results_df['Rank'] = results_df.index + 1
 
-# Reorder columns to mirror the reference: Rank, Model, Accuracy, F1, Precision, Recall, AUC, Selected
-results_df = results_df[['Rank', 'Model', 'Accuracy', 'F1', 'Precision', 'Recall', 'AUC', 'Selected', 'Fit_Time_s']]
+# Reorder columns to: Rank, Model, Accuracy, F1, Precision, Recall, AUC, Fit_Time_s
+results_df = results_df[['Rank', 'Model', 'Accuracy', 'F1', 'Precision', 'Recall', 'AUC', 'Fit_Time_s']]
 
 # ---------- Save metrics ----------
 base_excel_file = 'AI_ByteA_ModelMetrics.xlsx'
